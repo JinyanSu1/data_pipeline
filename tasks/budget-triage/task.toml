@@ -1,0 +1,52 @@
+# Harbor task definition for budget-triage.
+#
+# Verified against harbor 0.20.0.  Two things here are load-bearing and easy
+# to get wrong:
+#
+#   * schema_version must be "1.3".  The docs show "1.4"; this release rejects
+#     it.
+#   * `artifacts` must stay at the TOP LEVEL of this file.  Nested inside a
+#     table it parses silently into that table, nothing is ever collected, and
+#     the trial scores 0 with no error to explain why.
+schema_version = "1.3"
+
+# TOP LEVEL, and therefore ABOVE every [table] header -- TOML assigns a bare
+# key to whichever table precedes it, so putting this at the bottom of the
+# file would silently make it [environment].artifacts and collect nothing.
+artifacts = ["/app/solution.py"]
+
+[task]
+name = "harbor/budget-triage"
+description = """\
+Rank a pool of anomaly-detection alerts under a fixed investigation budget of \
+k=20 per period. Value is time-decaying, false alerts consume capacity, and \
+the ceiling is a provable optimum computed from hidden labels."""
+keywords = ["ranking", "prioritisation", "calibration", "decision-theory", "numpy"]
+
+[metadata]
+difficulty = "medium"
+category = "machine-learning"
+reward_floor = "random ordering (analytic, not sampled)"
+reward_ceiling = "provable optimum from the hidden labels"
+
+[verifier]
+# Separate container: the verifier image (tests/Dockerfile) carries the hidden
+# labels and setpriv, and the agent never sees either.
+environment_mode = "separate"
+timeout_sec = 900.0
+
+[agent]
+# 60 minutes.  This number and the "## Time budget" section at the end of
+# instruction.md are ONE FACT WRITTEN IN TWO PLACES -- change both together.
+timeout_sec = 3600.0
+
+[environment]
+build_timeout_sec = 900.0
+cpus = 2
+memory_mb = 4096
+
+# Deliberately no `network_mode` anywhere in this file.  The default `public`
+# baseline is required: the agent CLI installs itself under the [environment]
+# baseline, and giving [agent] a different policy would need
+# dynamic_network_policy, which the non-Docker backends do not have.  The task
+# itself is fully offline -- numpy is baked into the image.

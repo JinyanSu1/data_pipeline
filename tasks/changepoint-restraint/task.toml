@@ -1,0 +1,36 @@
+schema_version = "1.3"
+
+# Top level on purpose. Nested inside a table this key silently parses into
+# that table, nothing is ever collected, and the trial scores 0 with no error.
+artifacts = ["/app/solution.py"]
+
+[task]
+name = "harbor/changepoint-restraint"
+description = "Find the change points in a set of series when the number of change points is unknown, varies per series, and is sometimes zero."
+keywords = ["time-series", "change-point-detection", "model-selection", "statistics", "restraint"]
+
+[[task.authors]]
+name = "rl_research_envs"
+
+[metadata]
+domain = "time-series"
+reward_range = "0.0 - 1.0 (pooled F1, hard-gated on false positives over null series)"
+offline = true
+accelerator = "none"
+
+[environment]
+build_timeout_sec = 900.0
+cpus = 2
+memory_mb = 4096
+# network_mode is deliberately unset: the default `public` baseline is what
+# the agent CLI installs under, and a differing [agent] policy would need
+# dynamic_network_policy, which non-Docker backends do not have.
+
+[agent]
+# 3600 s = the "60 minutes" stated in instruction.md. One fact in two places:
+# change both together.
+timeout_sec = 3600.0
+
+[verifier]
+timeout_sec = 900.0
+environment_mode = "separate"

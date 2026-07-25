@@ -1,0 +1,59 @@
+# Harbor task definition -- verified against harbor 0.20.0.
+#
+# "1.3" is harbor 0.20.0's own default for this field and the value the rest
+# of this task suite uses; keep them consistent.
+schema_version = "1.3"
+
+# Must stay at the TOP LEVEL, i.e. above the first [table] header. TOML binds
+# any key written after a table header into that table, so moving this line
+# below (say) [solution] silently makes it solution.artifacts: nothing is
+# collected, and every trial scores 0.0 with no error message.
+artifacts = ["/app/solution.py"]
+
+[task]
+name = "rl-research-envs/drift-vs-anomaly"
+description = """Online multivariate anomaly detection on an industrial-sensor-like \
+stream that also contains benign concept drift. Flag the injected faults, do not \
+flag the drift. Scored with event-wise F1 (no point adjustment) behind a hard \
+drift false-positive gate."""
+keywords = [
+    "time-series",
+    "anomaly-detection",
+    "concept-drift",
+    "streaming",
+    "online-learning",
+    "numpy",
+]
+
+[[task.authors]]
+name = "rl_research_envs"
+
+[metadata]
+difficulty = "hard"
+category = "machine-learning"
+offline = true
+gpu = false
+
+[verifier]
+# The verifier runs in its own container built from tests/Dockerfile, so the
+# agent can never touch the grading code or the hidden episodes.
+environment_mode = "separate"
+timeout_sec = 1800.0
+
+[agent]
+# One fact in two places: this timeout and the "## Time budget" section at the
+# end of instruction.md must always say the same thing (3600 s == 60 minutes).
+# If you change one, change the other.
+timeout_sec = 3600.0
+
+[environment]
+build_timeout_sec = 900.0
+cpus = 2
+memory_mb = 4096
+# network_mode is deliberately NOT set anywhere in this file. The default
+# ("public") is the baseline for the [environment], and the agent CLI is
+# installed under that baseline; declaring a different policy under [agent]
+# would require dynamic_network_policy, which non-Docker backends do not
+# provide, and Harbor would then reject the task outright.
+
+[solution]

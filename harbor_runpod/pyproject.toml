@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "harbor-runpod"
+version = "0.1.0"
+description = "RunPod On-Demand Pod execution backend for the Harbor agent-evaluation framework"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+keywords = ["harbor", "runpod", "agent-evaluation", "sandbox"]
+
+# Exactly one runtime dependency, and it is not obvious why:
+#
+# * `dockerfile-parse` is needed because __init__ calls Harbor's
+#   `parse_dockerfile_workdir`, which imports it lazily. Harbor does not
+#   install it by default -- it is an extra, pulled in by `harbor[modal]`,
+#   `harbor[e2b]`, `harbor[beam]` and the other REMOTE backends, every one of
+#   which needs the same function. The `docker` backend never calls it, so a
+#   venv that runs local trials perfectly will still fail here with
+#   `ModuleNotFoundError: No module named 'dockerfile_parse'` at environment
+#   construction. Version floor matched to Harbor's own.
+# * The RunPod client in api.py is stdlib-only (urllib) and adds nothing.
+# * `harbor` itself is NOT declared: this package is only ever imported by a
+#   running Harbor process, and pinning Harbor here would fight with whatever
+#   version the user already has.
+# * The control channel needs the `ssh` and `ssh-keygen` binaries on PATH, and
+#   building a task image needs `docker`. Neither is a Python dependency;
+#   RunPodEnvironment.preflight() checks for them and exits with a clear
+#   message instead.
+dependencies = ["dockerfile-parse>=2.0.1"]
+
+[project.urls]
+Homepage = "https://github.com/harbor-framework/harbor"
+
+# ---------------------------------------------------------------------------
+# NOTE: there is intentionally no [project.entry-points] table here.
+#
+# Harbor does NOT discover environment backends through entry points. Two
+# mechanisms exist in the codebase and neither one applies:
+#
+#   * src/harbor/environments/factory.py holds `_ENVIRONMENT_REGISTRY`, a dict
+#     literal keyed by the closed `EnvironmentType` enum. Adding a backend
+#     there requires editing Harbor itself.
+#   * src/harbor/cli/plugin_registry.py reads the `harbor.plugins` entry point
+#     group, but `resolve_plugin_import_path` is called from exactly one place
+#     (cli/job_plugins.py) and the result must subclass `JobPlugin`. That group
+#     is for `--job-plugin`, not for environments.
+#
+# Out-of-tree environments are loaded by import path instead:
+#
+#     harbor run --env harbor_runpod:RunPodEnvironment ...
+#
+# `EnvironmentFactory.create_environment_from_import_path` imports the class
+# with `harbor.utils.import_path.import_class`, so this package only has to be
+# importable from the Harbor process. That is all this pyproject.toml provides.
+# See README.md, "Registering the backend".
+# ---------------------------------------------------------------------------
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+only-include = ["__init__.py", "api.py", "runpod_env.py"]
+sources = { "." = "harbor_runpod" }

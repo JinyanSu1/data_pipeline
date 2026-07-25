@@ -1,0 +1,17 @@
+# secrets — never commit
+.env
+*.env.local
+
+# python env / caches
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# data & run artifacts (live on Hugging Face, not git)
+jobs/
+results/
+
+# misc
+.DS_Store
+*.log
