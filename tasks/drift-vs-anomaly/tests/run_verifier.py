@@ -8,12 +8,13 @@ It:
   1. locks down /logs/verifier (0700 root) and the hidden episode file
      (0600 root),
   2. builds a label-free payload -- raw observations only, no anomaly_spans,
-     no drift_spans, no metadata,
+     no drift_spans, no metadata -- and keeps it in this process,
   3. copies the agent's /app/solution.py into a scratch directory,
-  4. runs the online loop inside an unprivileged child:
+  4. hosts the agent's Detector in an unprivileged child:
         setpriv --reuid nobody --regid nogroup --clear-groups python3 predict.py
-  5. reads back nothing but a vector of integers per episode, coerces it to
-     0/1, and scores it here,
+     and streams it one observation at a time, reading the decision for
+     step t before sending step t+1, so the child never holds a future sample,
+  5. coerces the decisions to 0/1 and scores them here,
   6. writes the scalar reward to /logs/verifier/reward.txt and the
      diagnostics to /logs/verifier/metrics.json.
 
@@ -25,9 +26,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -42,7 +45,7 @@ SOLUTION_PATH = "/app/solution.py"
 LOG_DIR = "/logs/verifier"
 REWARD_PATH = os.path.join(LOG_DIR, "reward.txt")
 METRICS_PATH = os.path.join(LOG_DIR, "metrics.json")
-CHILD_TIMEOUT_SEC = 900
+PREDICT_BUDGET_SEC = 600.0  # whole prediction phase; the rest scores as silence
 UNTRUSTED_USER = "nobody"
 UNTRUSTED_GROUP = "nogroup"
 
@@ -146,12 +149,32 @@ def sanitize(raw, episodes):
     return clean
 
 
+class _Timeout(Exception):
+    pass
+
+
+def _on_alarm(_signum, _frame):
+    raise _Timeout()
+
+
+def _exchange(proc, request):
+    if request is not None:
+        proc.stdin.write((json.dumps(request, separators=(",", ":")) + "\n").encode())
+        proc.stdin.flush()
+    line = proc.stdout.readline()
+    if not line:
+        raise RuntimeError("predictor closed the pipe")
+    return json.loads(line.decode("utf-8"))
+
+
 def run_child(payload):
+    """Drive the agent's Detector in lockstep, one observation per request.
+
+    The episode arrays stay in this (root) process.  The child is sent x_t and
+    must answer before x_{t+1} is sent, so it never holds a future sample.
+    """
     scratch = tempfile.mkdtemp(prefix="dva_", dir="/tmp")
     os.chmod(scratch, 0o755)
-    payload_path = os.path.join(scratch, "payload.json")
-    out_path = os.path.join(scratch, "pred.json")
-    out_log = os.path.join(scratch, "predictor.out")
     err_log = os.path.join(scratch, "predictor.err")
 
     solution_copy = os.path.join(scratch, "agent_solution.py")
@@ -161,18 +184,8 @@ def run_child(payload):
         with open(solution_copy, "w") as fh:
             fh.write("")
     os.chmod(solution_copy, 0o644)
-    payload["solution_path"] = solution_copy
 
-    with open(payload_path, "w") as fh:
-        json.dump(payload, fh, separators=(",", ":"))
-    os.chmod(payload_path, 0o644)
-
-    # The child must be able to create its output file inside the scratch dir.
-    with open(out_path, "w") as fh:
-        fh.write("{}")
-    os.chmod(out_path, 0o666)
-
-    cmd = [sys.executable, PREDICT_PATH, payload_path, out_path]
+    cmd = [sys.executable, PREDICT_PATH, solution_copy]
     if have_setpriv():
         cmd = [
             "setpriv",
@@ -194,53 +207,73 @@ def run_child(payload):
         "MPLCONFIGDIR": scratch,
     }
 
+    episodes = payload["episodes"]
+    raw = {ep["episode_id"]: [0] * int(ep["n_steps"]) for ep in episodes}
+    errors = {}
     status = {"cmd": " ".join(cmd), "timed_out": False, "returncode": None}
     print(f"[verifier] running untrusted predictor: {' '.join(cmd)}")
-    # Output goes to files, never to pipes: a solution that forks a detached
-    # daemon inherits the write end of a pipe and never closes it, so
-    # capture_output/communicate would block for the whole timeout.  Waiting on
-    # the direct child only is what we want.
-    with open(out_log, "wb") as fout, open(err_log, "wb") as ferr:
+    started = time.monotonic()
+    # stderr goes to a file, not a pipe, so a detached daemon holding it open
+    # cannot block us.  stdin/stdout are the lockstep protocol: we only ever
+    # wait for one line at a time, under a wall-clock budget.
+    with open(err_log, "wb") as ferr:
         proc = subprocess.Popen(
             cmd,
             cwd=scratch,
             env=child_env,
-            stdin=subprocess.DEVNULL,
-            stdout=fout,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
             stderr=ferr,
         )
+        old_handler = signal.signal(signal.SIGALRM, _on_alarm)
+        signal.setitimer(signal.ITIMER_REAL, PREDICT_BUDGET_SEC)
         try:
-            status["returncode"] = proc.wait(timeout=CHILD_TIMEOUT_SEC)
-        except subprocess.TimeoutExpired:
-            print(f"[verifier] predictor timed out after {CHILD_TIMEOUT_SEC}s")
-            proc.kill()
-            proc.wait()
+            hello = _exchange(proc, None)
+            if not hello.get("ok"):
+                errors["__import__"] = str(hello.get("error"))[:1500]
+            else:
+                for ep in episodes:
+                    eid = ep["episode_id"]
+                    ack = _exchange(proc, {"cmd": "init", "n_channels": ep["n_channels"]})
+                    if ack.get("ok"):
+                        out = raw[eid]
+                        for t, row in enumerate(ep["X"]):
+                            reply = _exchange(proc, {"cmd": "step", "x": row})
+                            out[t] = 1 if reply.get("d") == 1 else 0
+                    done = _exchange(proc, {"cmd": "end"})
+                    if done.get("error") or not ack.get("ok"):
+                        # one bad episode is not fatal, but it scores as silence
+                        errors[eid] = str(done.get("error") or ack.get("error"))[:600]
+                        raw[eid] = [0] * int(ep["n_steps"])
+                _exchange(proc, {"cmd": "done"})
+        except _Timeout:
+            print(f"[verifier] predictor exceeded {PREDICT_BUDGET_SEC:.0f}s; rest scored as silence")
             status["timed_out"] = True
-            status["returncode"] = 124
+        except Exception as exc:  # noqa: BLE001 - a broken child scores as silence
+            status["transport_error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old_handler)
+            for pipe in (proc.stdin, proc.stdout):
+                try:
+                    pipe.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                status["returncode"] = proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                status["returncode"] = 124
 
-    status["stdout"] = _tail(out_log)
+    status["child_elapsed_sec"] = time.monotonic() - started
     status["stderr"] = _tail(err_log)
-    if status["stdout"]:
-        print("--- predictor stdout (truncated) ---")
-        print(status["stdout"])
     if status["stderr"]:
         print("--- predictor stderr (truncated) ---")
         print(status["stderr"])
 
     # Best-effort cleanup of anything the child detached.
     subprocess.run(["pkill", "-9", "-u", UNTRUSTED_USER], check=False)
-
-    raw = {}
-    errors = {}
-    try:
-        with open(out_path) as fh:
-            data = json.load(fh)
-        if isinstance(data, dict):
-            raw = data.get("predictions") or {}
-            errors = data.get("errors") or {}
-            status["child_elapsed_sec"] = data.get("elapsed_sec")
-    except (OSError, ValueError) as exc:
-        status["read_error"] = f"{type(exc).__name__}: {exc}"
 
     shutil.rmtree(scratch, ignore_errors=True)
     return raw, errors, status
