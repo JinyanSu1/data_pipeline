@@ -149,21 +149,24 @@ anything the agent wrote**. It:
 1. `chmod 700 /logs/verifier`, `chmod 600 /tests/test_episodes.json`
    (`/tests` itself stays 755 so the child can read `predict.py`);
 2. builds a **label-free** payload -- `episode_id`, `n_channels`, `n_steps`,
-   `X` and nothing else: no `anomaly_spans`, no `drift_spans`, no `meta`;
+   `X` and nothing else: no `anomaly_spans`, no `drift_spans`, no `meta` --
+   and keeps it in the root process;
 3. copies `/app/solution.py` into a scratch dir and runs
    `setpriv --reuid nobody --regid nogroup --clear-groups python3 /tests/predict.py`;
-4. reads back only integers, coerces them to 0/1 and to the exact episode
-   length, and scores in the root process;
+4. streams the child one observation per request over stdin/stdout and reads
+   the 0/1 decision for step `t` before sending step `t+1`, so the child never
+   holds a future sample, then scores in the root process;
 5. writes a scalar to `/logs/verifier/reward.txt` and diagnostics to
    `metrics.json`. It never writes `reward.json`, and `test.sh` deletes any
    that appears (Harbor prefers `reward.json` over `reward.txt`).
 
-Child stdout/stderr go to files in the temp workdir rather than to pipes: a
-detached `os.fork()` daemon inherits the write end of a pipe and never closes
-it, so `capture_output` / `communicate` would block for the entire timeout.
-The verifier `Popen`s the child, `wait(timeout=900)`s on the *direct* child
-only, kills it on overrun, then tails the log files for diagnostics and runs
-`pkill -9 -u nobody`. The child also gets a minimal env (`HOME`/`TMPDIR`/
+Child stderr goes to a file in the temp workdir. stdin/stdout carry the
+lockstep protocol, and the verifier only ever waits for one reply line at a
+time under a 600 s budget for the whole prediction phase, so a detached
+`os.fork()` daemon holding a pipe open cannot block it. Agent prints are
+redirected to stderr inside the child so they cannot corrupt the protocol.
+After the run the verifier waits on the *direct* child only, kills it on
+overrun, tails the stderr log for diagnostics and runs `pkill -9 -u nobody`. The child also gets a minimal env (`HOME`/`TMPDIR`/
 `MPLCONFIGDIR` pointed at the scratch dir). Every failure path still writes a
 reward (0.0).
 
